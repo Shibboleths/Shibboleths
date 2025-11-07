@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Stock Rec – Final Consolidated Script (with Outlook fallback)
+
+What it does
+------------
+- Outlook fallback (optional, enabled below):
+    * If either source file is missing, pull latest from Outlook folder:
+        'MMcCullagh@tpicap.com\\Inbox\\DAILY STOCK'
+    * If File 1 (Stock Holding) is stale vs File 2 beyond threshold, try to refresh it from Outlook once.
+- Extracts ALL 'Statement Date' values from:
+    1) STOCK HOLDING.xlsx  (sheet 'Stock Holding', value immediately right of label 'Statement Date')
+    2) Reconciliation - All Entities.csv  (header column 'Statement Date' OR label/value patterns)
+- Selects MOST RECENT date for each file; normalizes to 'YYYY-MMM-DD'; compares
+- Writes flags:
+    * ERROR_MissingFile1/2
+    * ERROR_StaleFile1_<N>bd
+    * MISMATCH
+    * (optional) OK
+- On agreement: saves BOTH files to UNC structure, renamed with 'YYYY-MM-DD Ddd', skipping if the
+  destination file already exists.
+- Appends an audit row every run.
+
+Exit codes
+----------
+0 = success (agree; UNC saves attempted; skip if already exists)
+3 = stale or mismatch (flags written; no UNC save unless quarantine enabled)
+2 = error (missing or read/parse error)
+
+NOTE: This script assumes Windows + Outlook Desktop for fallback/alerts.
+"""
+
+import csv
+import datetime as dt
+import re
+import sys
+from pathlib import Path
+from shutil import copy2
+
+# ------------------- INPUT PATHS -------------------
+STOCK_HOLDING_PATH = r"O:\Daily Stock Rec\Inbound\STOCK HOLDING.xlsx"                # File 1
+RECON_ALL_ENTITIES_PATH = r"O:\Daily Stock Rec\Inbound\Reconciliation - All Entities.csv"  # File 2
+
+# ------------------- AUDIT & FLAGS ----------------
+AUDIT_LOG_PATH = r"O:\Daily Stock Rec\Audit\stock_rec_date_check_audit.csv"
+FLAG_DIR = r"O:\Daily Stock Rec\Flags"
+CLEAN_OLD_FLAGS = True
+CREATE_OK_FLAG = False
+
+# ------------------- UNC OUTPUT -------------------
+UNC_BASE = r"\\icap.com\icaproot\Global\EMEA\UK\Department\UK Operations\Operational Services\Recs\Daily Stock Holding"
+SAVE_ON_AGREE = True
+SAVE_ON_MISMATCH = False
+QUARANTINE_SUBFOLDER = "__Mismatches"
+
+# ------------------- STALE THRESHOLD --------------
+# If File 1 date lags File 2 by > N business days => treat as STALE (clearer than generic mismatch)
+MAX_FILE1_AGE_BUSINESS_DAYS = 2
+
+# ------------------- ALERTING (optional) ----------
+USE_TEAMS_ALERT = False
+TEAMS_WEBHOOK_URL = ""  # e.g., https://<org>.webhook.office.com/webhookb2/...
+
+USE_OUTLOOK_EMAIL_ALERT = False
+EMAIL_TO = "ops-mailbox@tpicap.com"
+EMAIL_SUBJECT = "[Alert] Stock Rec issue"
+
+# ------------------- OUTLOOK FALLBACK -------------
+# Enable fetching from Outlook if missing or stale
+ENABLE_OUTLOOK_FALLBACK_FILE1 = True   # Stock Holding.xlsx
+ENABLE_OUTLOOK_FALLBACK_FILE2 = True   # Reconciliation - All Entities.csv
+
+# Target folder (supports multi-mailbox path)
+OUTLOOK_FOLDER_FILE1 = r"MMcCullagh@tpicap.com\Inbox\DAILY STOCK"
+OUTLOOK_FOLDER_FILE2 = r"MMcCullagh@tpicap.com\Inbox\DAILY STOCK"
+
+# Subject/attachment cues (keep subject empty "" if you prefer attachment-name only)
+OUTLOOK_SUBJECT_CONTAINS_FILE1 = "@Stock Holding"
+OUTLOOK_SUBJECT_CONTAINS_FILE2 = "@Stock Rec All Entities EOD/"
+
+ATTACH_NAME_CONTAINS_FILE1 = "Stock Holding"                  # .xlsx
+ATTACH_NAME_CONTAINS_FILE2 = "Reconciliation - All Entities"  # .csv
+
+OUTLOOK_SEARCH_WINDOW_DAYS = 10  # how far back to look if today is empty
+
+# -------------- Patterns & helpers ----------------
+MONTH_ABBR = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+WEEKDAY_ABBR = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+RE_DD_MMM_YYYY = re.compile(r"\b(0[1-9]|[12]\d|3[01])-[A-Za-z]{3}-\d{4}\b")
+RE_DD_MM_YYYY  = re.compile(r"\b(0[1-9]|[12]\d|3[01])/(0[1-9]|1[0-2])/\d{4}\b")
+
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def parse_date_token(token: str):
+    """Parse 'DD-MMM-YYYY' (preferred) or 'DD/MM/YYYY' to date."""
+    if not token:
+        return None
+    s = str(token).strip()
+    m = RE_DD_MMM_YYYY.search(s)
+    if m:
+        try:
+            return dt.datetime.strptime(m.group(0), "%d-%b-%Y").date()
+        except ValueError:
+            pass
+    m = RE_DD_MM_YYYY.search(s)
+    if m:
+        try:
+            return dt.datetime.strptime(m.group(0), "%d/%m/%Y").date()
+        except ValueError:
+            pass
+    for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+def normalize_yyyy_mmm_dd(d: dt.date) -> str:
+    return f"{d.year}-{MONTH_ABBR[d.month]}-{d.day:02d}"
+
+def build_unc_target(base: str, d: dt.date) -> Path:
+    """UNC\YYYY\YYYY-MM Mon\YYYY-MM-DD Ddd"""
+    year_folder = f"{d.year}"
+    month_folder = f"{d.year}-{d.month:02d} {MONTH_ABBR[d.month]}"
+    day_folder = f"{d.year}-{d.month:02d}-{d.day:02d} {WEEKDAY_ABBR[d.weekday()]}"
+    return Path(base) / year_folder / month_folder / day_folder
+
+def preferred_base_name(src: Path) -> str:
+    name = src.name.lower()
+    if name == "stock holding.xlsx":
+        return "Stock Holding"
+    if name == "reconciliation - all entities.csv":
+        return "Reconciliation - All Entities"
+    return src.stem
+
+def dated_filename(src: Path, d: dt.date) -> str:
+    base = preferred_base_name(src)
+    day = f"{d.year}-{d.month:02d}-{d.day:02d} {WEEKDAY_ABBR[d.weekday()]}"
+    return f"{base} {day}{src.suffix}"
+
+def copy_if_absent(src: Path, dest: Path) -> bool:
+    if dest.exists():
+        print(f"⚠️  Skipped (already exists): {dest}")
+        return False
+    copy2(src, dest)
+    print(f"✅ Saved: {dest}")
+    return True
+
+def business_days_between(d1: dt.date, d2: dt.date) -> int:
+    if d1 == d2:
+        return 0
+    start, end = (d1, d2) if d1 < d2 else (d2, d1)
+    days = 0
+    d = start
+    while d < end:
+        if d.weekday() < 5:
+            days += 1
+        d += dt.timedelta(days=1)
+    return days
+
+# ---------------- Outlook helpers -----------------
+def _get_outlook_folder_by_path(root_ns, path_spec: str):
+    """
+    Returns Outlook MAPIFolder given a path like 'MMcCullagh@tpicap.com\\Inbox\\DAILY STOCK'
+    Supports primary or additional mailboxes (Session.Folders).
+    """
+    parts = [p for p in path_spec.replace("/", "\\").split("\\") if p]
+    if not parts:
+        raise ValueError("Empty Outlook folder path")
+    mailbox = root_ns.Folders.Item(parts[0])
+    cur = mailbox
+    for p in parts[1:]:
+        cur = cur.Folders.Item(p)
+    return cur
+
+def outlook_pull_latest_attachment(folder_path: str,
+                                   subject_contains: str,
+                                   attach_name_contains: str,
+                                   save_dir: Path,
+                                   extensions: tuple[str, ...] = (),
+                                   days_back: int = 10) -> Path | None:
+    """
+    Finds latest email in Outlook folder and saves first matching attachment.
+    """
+    try:
+        import win32com.client as win32  # pip install pywin32
+    except Exception:
+        print("⚠️  Outlook COM not available (pywin32 missing).")
+        return None
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    folder = _get_outlook_folder_by_path(ns, folder_path)
+
+    items = folder.Items
+    items.Sort("[ReceivedTime]", True)  # newest first
+
+    from_dt = (dt.datetime.now() - dt.timedelta(days=days_back))
+    subj_key = (subject_contains or "").lower()
+    name_key = (attach_name_contains or "").lower()
+
+    for itm in items:
+        try:
+            rt = getattr(itm, "ReceivedTime", None)
+            if rt and rt < from_dt:
+                break
+            subj = (itm.Subject or "")
+            if subj_key and subj_key not in subj.lower():
+                continue
+            atts = getattr(itm, "Attachments", None)
+            if not atts or atts.Count == 0:
+                continue
+            for i in range(1, atts.Count + 1):
+                att = atts.Item(i)
+                fname = str(att.FileName)
+                if name_key and name_key not in fname.lower():
+                    continue
+                if extensions and not any(fname.lower().endswith(ext) for ext in extensions):
+                    continue
+                dest = save_dir / fname
+                att.SaveAsFile(str(dest))
+                print(f"📥 Pulled from Outlook: {dest}")
+                return dest
+        except Exception:
+            continue
+    print("ℹ️  No matching Outlook attachment found in the search window.")
+    return None
+
+# ------------- XLSX: STOCK HOLDING extractor -------------
+def extract_all_statement_dates_from_stock_holding(xlsx_path: Path):
+    try:
+        import openpyxl
+    except Exception as e:
+        raise RuntimeError("openpyxl required: pip install openpyxl") from e
+
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"Missing: {xlsx_path}")
+
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    if "Stock Holding" not in wb.sheetnames:
+        raise RuntimeError("Worksheet 'Stock Holding' not found in STOCK HOLDING.xlsx")
+
+    ws = wb["Stock Holding"]
+    dates = []
+    for row in ws.iter_rows(min_row=1, max_row=300, min_col=1, max_col=50):
+        for cell in row:
+            txt = (str(cell.value).strip().lower() if cell.value is not None else "")
+            if txt == "statement date":
+                right = ws.cell(row=cell.row, column=cell.column + 1).value
+                if isinstance(right, dt.datetime):
+                    dates.append(right.date())
+                elif isinstance(right, dt.date):
+                    dates.append(right)
+                else:
+                    d = parse_date_token(str(right))
+                    if d:
+                        dates.append(d)
+    return dates
+
+# ------------- CSV: ALL ENTITIES extractor ---------------
+def _sniff_csv_dialect(sample_text: str):
+    try:
+        return csv.Sniffer().sniff(sample_text)
+    except Exception:
+        return csv.excel
+
+def extract_all_statement_dates_from_recon_csv(csv_path: Path):
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Missing: {csv_path}")
+
+    dates = []
+    head_text = csv_path.read_text(encoding="utf-8-sig", errors="ignore")[:8000]
+    dialect = _sniff_csv_dialect(head_text)
+
+    # Headered CSV path
+    with csv_path.open("r", newline="", encoding="utf-8-sig", errors="ignore") as f:
+        rdr = csv.DictReader(f, dialect=dialect)
+        if rdr.fieldnames:
+            norm = {h.lower().strip(): h for h in rdr.fieldnames if h}
+            if "statement date" in norm:
+                col = norm["statement date"]
+                for row in rdr:
+                    d = parse_date_token(row.get(col, ""))
+                    if d:
+                        dates.append(d)
+
+    if not dates:
+        # Label/value patterns anywhere in file
+        full_text = csv_path.read_text(encoding="utf-8-sig", errors="ignore")
+        # same line: 'Statement Date,04-Aug-2025'
+        for m in re.finditer(r"(?i)statement\s*date[^0-9A-Za-z]+(\d{2}-[A-Za-z]{3}-\d{4})", full_text):
+            d = parse_date_token(m.group(1))
+            if d:
+                dates.append(d)
+        # next line:
+        for m in re.finditer(r"(?i)statement\s*date[^\r\n]*\r?\n\s*(\d{2}-[A-Za-z]{3}-\d{4})", full_text):
+            d = parse_date_token(m.group(1))
+            if d:
+                dates.append(d)
+
+    return dates
+
+# ------------------- ALERTS & LOGGING -------------------
+def append_audit_row(audit_path: Path, row: dict):
+    ensure_dir(audit_path.parent)
+    write_header = not audit_path.exists()
+    with audit_path.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=[
+            "timestamp_utc",
+            "status",
+            "stock_holding_path",
+            "all_entities_path",
+            "latest_stock_iso",
+            "latest_csv_iso",
+            "latest_stock_norm",
+            "latest_csv_norm",
+            "agree",
+            "copied_csv",
+            "copied_xlsx",
+            "note"
+        ])
+        if write_header:
+            w.writeheader()
+        w.writerow(row)
+
+def clean_old_flags(flag_dir: Path, prefix: str):
+    if not CLEAN_OLD_FLAGS:
+        return
+    for p in flag_dir.glob(f"{prefix}*.flag"):
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+def write_flag(flag_dir: Path, name: str, content: str):
+    ensure_dir(flag_dir)
+    p = flag_dir / name
+    with p.open("w", encoding="utf-8") as f:
+        f.write(content)
+    return p
+
+def send_teams_alert(webhook_url: str, title: str, lines: list[str]):
+    try:
+        import json
+        from urllib.request import Request, urlopen
+        payload = {"text": "**" + title + "**\n\n" + "\n.join(f'- {ln}' for ln in lines)"}
+        # fix formatting
+        text = "**" + title + "**\n\n" + "\n".join(f"- {ln}" for ln in lines)
+        payload = {"text": text}
+        req = Request(webhook_url, data=json.dumps(payload).encode("utf-8"),
+                      headers={"Content-Type": "application/json"})
+        urlopen(req, timeout=10).read()
+        return True
+    except Exception:
+        return False
+
+def send_outlook_email(to_addr: str, subject: str, body_html: str):
+    try:
+        import win32com.client as win32  # pip install pywin32 (optional)
+        ol = win32.Dispatch("Outlook.Application")
+        mail = ol.CreateItem(0)
+        mail.To = to_addr
+        mail.Subject = subject
+        mail.HTMLBody = body_html
+        mail.Send()
+        return True
+    except Exception:
+        return False
+
+# -------------------------- MAIN --------------------------
+def main():
+    stock_path = Path(STOCK_HOLDING_PATH)
+    csv_path = Path(RECON_ALL_ENTITIES_PATH)
+    flag_dir = Path(FLAG_DIR)
+    flag_prefix = "StockRec_"
+    ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    # ----- Outlook fallback on missing files -----
+    if not stock_path.exists() and ENABLE_OUTLOOK_FALLBACK_FILE1:
+        pulled = outlook_pull_latest_attachment(
+            folder_path=OUTLOOK_FOLDER_FILE1,
+            subject_contains=OUTLOOK_SUBJECT_CONTAINS_FILE1,
+            attach_name_contains=ATTACH_NAME_CONTAINS_FILE1,
+            save_dir=stock_path.parent,
+            extensions=(".xlsx",),
+            days_back=OUTLOOK_SEARCH_WINDOW_DAYS
+        )
+        if pulled:
+            stock_path = Path(pulled)
+
+    if not csv_path.exists() and ENABLE_OUTLOOK_FALLBACK_FILE2:
+        pulled = outlook_pull_latest_attachment(
+            folder_path=OUTLOOK_FOLDER_FILE2,
+            subject_contains=OUTLOOK_SUBJECT_CONTAINS_FILE2,
+            attach_name_contains=ATTACH_NAME_CONTAINS_FILE2,
+            save_dir=csv_path.parent,
+            extensions=(".csv",),
+            days_back=OUTLOOK_SEARCH_WINDOW_DAYS
+        )
+        if pulled:
+            csv_path = Path(pulled)
+
+    # ----- Missing file handling (after fallback) -----
+    if not stock_path.exists():
+        name = f"{flag_prefix}ERROR_MissingFile1_{ts}.flag"
+        body = f"timestamp_utc={ts}\nstatus=ERROR\nmissing={Path(STOCK_HOLDING_PATH).name}\n"
+        write_flag(flag_dir, name, body)
+        print(f"❗ Missing file: {stock_path}  → Flag: {flag_dir / name}")
+        append_audit_row(Path(AUDIT_LOG_PATH), {
+            "timestamp_utc": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "status": "ERROR_MISSING_FILE1",
+            "stock_holding_path": str(stock_path),
+            "all_entities_path": str(csv_path),
+            "latest_stock_iso": "",
+            "latest_csv_iso": "",
+            "latest_stock_norm": "",
+            "latest_csv_norm": "",
+            "agree": "n/a",
+            "copied_csv": "n/a",
+            "copied_xlsx": "n/a",
+            "note": "File 1 missing"
+        })
+        sys.exit(2)
+
+    if not csv_path.exists():
+        name = f"{flag_prefix}ERROR_MissingFile2_{ts}.flag"
+        body = f"timestamp_utc={ts}\nstatus=ERROR\nmissing={Path(RECON_ALL_ENTITIES_PATH).name}\n"
+        write_flag(flag_dir, name, body)
+        print(f"❗ Missing file: {csv_path}  → Flag: {flag_dir / name}")
+        append_audit_row(Path(AUDIT_LOG_PATH), {
+            "timestamp_utc": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "status": "ERROR_MISSING_FILE2",
+            "stock_holding_path": str(stock_path),
+            "all_entities_path": str(csv_path),
+            "latest_stock_iso": "",
+            "latest_csv_iso": "",
+            "latest_stock_norm": "",
+            "latest_csv_norm": "",
+            "agree": "n/a",
+            "copied_csv": "n/a",
+            "copied_xlsx": "n/a",
+            "note": "File 2 missing"
+        })
+        sys.exit(2)
+
+    # ----- Extract ALL dates -----
+    try:
+        dates_stock = extract_all_statement_dates_from_stock_holding(stock_path)
+    except Exception as e:
+        print(f"ERROR reading STOCK HOLDING.xlsx — {e}")
+        sys.exit(2)
+    try:
+        dates_csv = extract_all_statement_dates_from_recon_csv(csv_path)
+    except Exception as e:
+        print(f"ERROR reading Reconciliation - All Entities.csv — {e}")
+        sys.exit(2)
+
+    if not dates_stock:
+        print("ERROR: No 'Statement Date' found in STOCK HOLDING.xlsx"); sys.exit(2)
+    if not dates_csv:
+        print("ERROR: No 'Statement Date' found in Reconciliation - All Entities.csv"); sys.exit(2)
+
+    latest_stock = max(dates_stock)
+    latest_csv = max(dates_csv)
+    latest_stock_norm = normalize_yyyy_mmm_dd(latest_stock)
+    latest_csv_norm   = normalize_yyyy_mmm_dd(latest_csv)
+
+    print(f"Latest STOCK HOLDING 'Statement Date' : {latest_stock_norm}  ({stock_path.name})")
+    print(f"Latest All Entities 'Statement Date'  : {latest_csv_norm}    ({csv_path.name})")
+
+    # ----- If File 1 looks stale, try Outlook refresh once -----
+    age_bd = 0
+    if latest_stock < latest_csv:
+        age_bd = business_days_between(latest_stock, latest_csv)
+        if age_bd > MAX_FILE1_AGE_BUSINESS_DAYS and ENABLE_OUTLOOK_FALLBACK_FILE1:
+            pulled = outlook_pull_latest_attachment(
+                folder_path=OUTLOOK_FOLDER_FILE1,
+                subject_contains=OUTLOOK_SUBJECT_CONTAINS_FILE1,
+                attach_name_contains=ATTACH_NAME_CONTAINS_FILE1,
+                save_dir=stock_path.parent,
+                extensions=(".xlsx",),
+                days_back=OUTLOOK_SEARCH_WINDOW_DAYS
+            )
+            if pulled:
+                # Re-extract File 1 date(s)
+                new_dates = extract_all_statement_dates_from_stock_holding(Path(pulled))
+                if new_dates:
+                    latest_stock = max(new_dates)
+                    latest_stock_norm = normalize_yyyy_mmm_dd(latest_stock)
+                    age_bd = business_days_between(latest_stock, latest_csv)
+                    print(f"🔄 Refreshed STOCK HOLDING from Outlook → {latest_stock_norm}")
+
+    # ----- STALE detection (after potential refresh) -----
+    if latest_stock < latest_csv:
+        age_bd = business_days_between(latest_stock, latest_csv)
+        if age_bd > MAX_FILE1_AGE_BUSINESS_DAYS:
+            clean_old_flags(flag_dir, flag_prefix)
+            name = f"{flag_prefix}ERROR_StaleFile1_{age_bd}bd_{ts}.flag"
+            body = (
+                f"timestamp_utc={ts}\nstatus=ERROR\nreason=File1 stale vs File2\n"
+                f"file1_date={latest_stock}\nfile2_date={latest_csv}\n"
+                f"age_business_days={age_bd}\n"
+            )
+            write_flag(flag_dir, name, body)
+            print(f"❗ File 1 (Stock Holding) STALE by {age_bd} business days "
+                  f"({latest_stock_norm} vs {latest_csv_norm}). Flag: {flag_dir / name}")
+
+            # Optional alerts
+            if USE_TEAMS_ALERT and TEAMS_WEBHOOK_URL:
+                send_teams_alert(
+                    TEAMS_WEBHOOK_URL,
+                    "Stock Rec – STALE File 1",
+                    [
+                        f"File 1: {latest_stock_norm} ({stock_path.name})",
+                        f"File 2: {latest_csv_norm} ({csv_path.name})",
+                        f"Age (business days): {age_bd}"
+                    ]
+                )
+            if USE_OUTLOOK_EMAIL_ALERT:
+                body_html = (f"<p><b>Stock Rec – STALE File 1</b></p>"
+                             f"<ul><li>File 1: <code>{latest_stock_norm}</code> ({stock_path.name})</li>"
+                             f"<li>File 2: <code>{latest_csv_norm}</code> ({csv_path.name})</li>"
+                             f"<li>Age (business days): {age_bd}</li></ul>")
+                send_outlook_email(EMAIL_TO, EMAIL_SUBJECT, body_html)
+
+            append_audit_row(Path(AUDIT_LOG_PATH), {
+                "timestamp_utc": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "status": "ERROR_STALE_FILE1",
+                "stock_holding_path": str(stock_path),
+                "all_entities_path": str(csv_path),
+                "latest_stock_iso": latest_stock.isoformat(),
+                "latest_csv_iso": latest_csv.isoformat(),
+                "latest_stock_norm": latest_stock_norm,
+                "latest_csv_norm": latest_csv_norm,
+                "agree": "false",
+                "copied_csv": "false",
+                "copied_xlsx": "false",
+                "note": f"File1 stale by {age_bd} business days"
+            })
+
+            if SAVE_ON_MISMATCH:
+                qdir = Path(UNC_BASE) / QUARANTINE_SUBFOLDER / ts
+                ensure_dir(qdir)
+                copy2(csv_path, qdir / csv_path.name)
+                copy2(stock_path, qdir / stock_path.name)
+                print(f"Quarantined copies saved to: {qdir}")
+
+            sys.exit(3)
+
+    # ----- MISMATCH (dates unequal but not stale per threshold) -----
+    agree = (latest_stock_norm == latest_csv_norm)
+    if not agree:
+        clean_old_flags(flag_dir, flag_prefix)
+        name = f"{flag_prefix}MISMATCH_{latest_stock_norm}_vs_{latest_csv_norm}_{ts}.flag"
+        body = (
+            f"timestamp_utc={ts}\nstatus=MISMATCH\n"
+            f"latest_stock_norm={latest_stock_norm}\n"
+            f"latest_csv_norm={latest_csv_norm}\n"
+            f"stock_file={stock_path.name}\n"
+            f"csv_file={csv_path.name}\n"
+            f"age_business_days={age_bd}\n"
+        )
+        write_flag(flag_dir, name, body)
+        print(f"❌ Dates differ → Flag: {flag_dir / name}")
+
+        # Optional alerts
+        if USE_TEAMS_ALERT and TEAMS_WEBHOOK_URL:
+            send_teams_alert(
+                TEAMS_WEBHOOK_URL,
+                "Stock Rec – Date Mismatch",
+                [
+                    f"File 1: {latest_stock_norm} ({stock_path.name})",
+                    f"File 2: {latest_csv_norm} ({csv_path.name})",
+                    f"Age (business days): {age_bd}"
+                ]
+            )
+        if USE_OUTLOOK_EMAIL_ALERT:
+            body_html = (f"<p><b>Stock Rec – Date Mismatch</b></p>"
+                         f"<ul><li>File 1: <code>{latest_stock_norm}</code> ({stock_path.name})</li>"
+                         f"<li>File 2: <code>{latest_csv_norm}</code> ({csv_path.name})</li>"
+                         f"<li>Age (business days): {age_bd}</li></ul>")
+            send_outlook_email(EMAIL_TO, EMAIL_SUBJECT, body_html)
+
+        append_audit_row(Path(AUDIT_LOG_PATH), {
+            "timestamp_utc": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "status": "MISMATCH",
+            "stock_holding_path": str(stock_path),
+            "all_entities_path": str(csv_path),
+            "latest_stock_iso": latest_stock.isoformat(),
+            "latest_csv_iso": latest_csv.isoformat(),
+            "latest_stock_norm": latest_stock_norm,
+            "latest_csv_norm": latest_csv_norm,
+            "agree": "false",
+            "copied_csv": "false",
+            "copied_xlsx": "false",
+            "note": "Dates unequal (not hitting stale threshold)"
+        })
+
+        if SAVE_ON_MISMATCH:
+            qdir = Path(UNC_BASE) / QUARANTINE_SUBFOLDER / ts
+            ensure_dir(qdir)
+            copy2(csv_path, qdir / csv_path.name)
+            copy2(stock_path, qdir / stock_path.name)
+            print(f"Quarantined copies saved to: {qdir}")
+
+        sys.exit(3)
+
+    # ----- AGREEMENT: Save to UNC with renamed outputs (no overwrite) -----
+    print("✅ Dates agree.")
+    clean_old_flags(flag_dir, flag_prefix)
+
+    copied_csv = False
+    copied_xlsx = False
+
+    if SAVE_ON_AGREE:
+        target_dir = build_unc_target(UNC_BASE, latest_stock)
+        ensure_dir(target_dir)
+
+        out_csv_name  = dated_filename(Path(RECON_ALL_ENTITIES_PATH), latest_stock)
+        out_xlsx_name = dated_filename(Path(STOCK_HOLDING_PATH),      latest_stock)
+
+        csv_dest  = target_dir / out_csv_name
+        xlsx_dest = target_dir / out_xlsx_name
+
+        copied_csv  = copy_if_absent(csv_path,  csv_dest)
+        copied_xlsx = copy_if_absent(stock_path, xlsx_dest)
+
+    if CREATE_OK_FLAG:
+        ok_name = f"{flag_prefix}OK_{latest_stock_norm}_{ts}.flag"
+        ok_body = (
+            f"timestamp_utc={ts}\nstatus=OK\n"
+            f"latest_stock_norm={latest_stock_norm}\n"
+            f"stock_file={stock_path.name}\n"
+            f"csv_file={csv_path.name}\n"
+        )
+        write_flag(flag_dir, ok_name, ok_body)
+        print(f"OK flag written: {flag_dir / ok_name}")
+
+    append_audit_row(Path(AUDIT_LOG_PATH), {
+        "timestamp_utc": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "status": "OK",
+        "stock_holding_path": str(stock_path),
+        "all_entities_path": str(csv_path),
+        "latest_stock_iso": latest_stock.isoformat(),
+        "latest_csv_iso": latest_csv.isoformat(),
+        "latest_stock_norm": latest_stock_norm,
+        "latest_csv_norm": latest_csv_norm,
+        "agree": "true",
+        "copied_csv": "true" if copied_csv else "false",
+        "copied_xlsx": "true" if copied_xlsx else "false",
+        "note": "Saved to UNC (skips indicate prior presence)"
+    })
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
